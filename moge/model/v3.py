@@ -9,7 +9,7 @@ try:
 except ImportError:
     import utils3d
 
-from ..utils.geometry_torch import normalized_view_plane_uv, recover_focal_shift
+from ..utils.geometry_torch import normalized_view_plane_uv, prepare_intrinsics, recover_focal_shift, recover_shift_from_intrinsics
 from .v2 import MoGeModel as MoGeModelV2
 from .modules.sparse_unet import Sparse3DUNet
 
@@ -228,6 +228,7 @@ class MoGeModel(MoGeModelV2):
         refine_steps: int = 3,
         return_per_step: bool = False,
         use_fp16: bool = False,
+        intrinsics: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         User-friendly inference function
@@ -242,6 +243,7 @@ class MoGeModel(MoGeModelV2):
         - `refine_steps`: number of sparse 3D refinement updates. Default: 3.
         - `return_per_step`: if True, return predictions for the initial estimate and every refinement step. Default: False.
         - `use_fp16`: if True, use mixed precision to speed up inference. Default: False.
+        - `intrinsics`: optional normalized OpenCV camera intrinsics of shape (B, 3, 3) or (3, 3). Mutually exclusive with `fov_x`.
 
         ### Returns
         A dictionary containing the following keys when the corresponding outputs are available:
@@ -263,6 +265,12 @@ class MoGeModel(MoGeModelV2):
         else:
             omit_batch_dim = False
         image = image.to(dtype=self.dtype, device=self.device)
+
+        if intrinsics is not None and fov_x is not None:
+            raise ValueError("intrinsics and fov_x are mutually exclusive")
+        input_intrinsics = None if intrinsics is None else prepare_intrinsics(
+            intrinsics, batch_size=image.shape[0], device=image.device
+        )
 
         original_height, original_width = image.shape[-2:]
         aspect_ratio = original_width / original_height
@@ -294,7 +302,7 @@ class MoGeModel(MoGeModelV2):
                 # the 3D shape, so focal recovered from each step's point map differs slightly
                 # Jointly solving (focal, shift) on the same point map gives the optimal
                 # affine->camera alignment for that step (matches v2_4's single-step logic).
-                if fov_x is not None:
+                if input_intrinsics is None and fov_x is not None:
                     focal_fixed = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / torch.tan(torch.deg2rad(torch.as_tensor(fov_x, device=self.device, dtype=torch.float32) / 2))
                     if focal_fixed.ndim == 0:
                         focal_fixed = focal_fixed[None].expand(affine_points_per_step[-1].shape[0])
@@ -303,13 +311,18 @@ class MoGeModel(MoGeModelV2):
 
                 points_per_step, depth_per_step, intrinsics_per_step = [], [], []
                 for affine_points in affine_points_per_step:
-                    if focal_fixed is None:
+                    if input_intrinsics is not None:
+                        intrinsics_i = input_intrinsics
+                        shift_i = recover_shift_from_intrinsics(affine_points, intrinsics_i, mask_binary)
+                    elif focal_fixed is None:
                         focal_i, shift_i = recover_focal_shift(affine_points, mask_binary)
+                        fx_i, fy_i = focal_i / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio, focal_i / 2 * (1 + aspect_ratio ** 2) ** 0.5
+                        intrinsics_i = utils3d.pt.intrinsics_from_focal_center(fx_i, fy_i, 0.5, 0.5)
                     else:
                         focal_i = focal_fixed
                         _, shift_i = recover_focal_shift(affine_points, mask_binary, focal=focal_i)
-                    fx_i, fy_i = focal_i / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio, focal_i / 2 * (1 + aspect_ratio ** 2) ** 0.5
-                    intrinsics_i = utils3d.pt.intrinsics_from_focal_center(fx_i, fy_i, 0.5, 0.5)
+                        fx_i, fy_i = focal_i / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio, focal_i / 2 * (1 + aspect_ratio ** 2) ** 0.5
+                        intrinsics_i = utils3d.pt.intrinsics_from_focal_center(fx_i, fy_i, 0.5, 0.5)
 
                     points = affine_points.clone()
                     points[..., 2] += shift_i[..., None, None]

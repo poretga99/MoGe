@@ -19,7 +19,7 @@ except ImportError:
 from huggingface_hub import hf_hub_download
 
 
-from ..utils.geometry_torch import normalized_view_plane_uv, recover_focal_shift, gaussian_blur_2d, dilate_with_mask
+from ..utils.geometry_torch import normalized_view_plane_uv, prepare_intrinsics, recover_focal_shift, recover_shift_from_intrinsics, gaussian_blur_2d, dilate_with_mask
 from .utils import wrap_module_with_gradient_checkpointing, unwrap_module_with_gradient_checkpointing
 from ..utils.tools import timeit
 
@@ -311,6 +311,7 @@ class MoGeModel(nn.Module):
         apply_mask: bool = True,
         force_projection: bool = True,
         use_fp16: bool = True,
+        intrinsics: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         User-friendly inference function
@@ -326,6 +327,7 @@ class MoGeModel(nn.Module):
         - `apply_mask`: if True, the output point map will be masked using the predicted mask. Default: True
         - `force_projection`: if True, the output point map will be recomputed to match the projection constraint. Default: True
         - `use_fp16`: if True, use mixed precision to speed up inference. Default: True
+        - `intrinsics`: optional normalized OpenCV camera intrinsics of shape (B, 3, 3) or (3, 3). Mutually exclusive with `fov_x`.
             
         ### Returns
 
@@ -340,6 +342,12 @@ class MoGeModel(nn.Module):
         else:
             omit_batch_dim = False
         image = image.to(dtype=self.dtype, device=self.device)
+
+        if intrinsics is not None and fov_x is not None:
+            raise ValueError("intrinsics and fov_x are mutually exclusive")
+        input_intrinsics = None if intrinsics is None else prepare_intrinsics(
+            intrinsics, batch_size=image.shape[0], device=image.device
+        )
 
         original_height, original_width = image.shape[-2:]
         aspect_ratio = original_width / original_height
@@ -359,16 +367,24 @@ class MoGeModel(nn.Module):
             mask_binary = mask > self.mask_threshold
 
             # Get camera-space point map. (Focal here is the focal length relative to half the image diagonal)
-            if fov_x is None:
+            if input_intrinsics is not None:
+                intrinsics = input_intrinsics
+                shift = recover_shift_from_intrinsics(points, intrinsics, mask_binary)
+            elif fov_x is None:
                 focal, shift = recover_focal_shift(points, mask_binary)
+                fx = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio
+                fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5
+                center = torch.tensor(0.5, device=points.device, dtype=points.dtype)
+                intrinsics = utils3d.pt.intrinsics_from_focal_center(fx, fy, center, center)
             else:
                 focal = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / torch.tan(torch.deg2rad(torch.as_tensor(fov_x, device=points.device, dtype=points.dtype) / 2))
                 if focal.ndim == 0:
                     focal = focal[None].expand(points.shape[0])
                 _, shift = recover_focal_shift(points, mask_binary, focal=focal)
-            fx = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio
-            fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 
-            intrinsics = utils3d.pt.intrinsics_from_focal_center(fx, fy, torch.tensor(0.5, device=points.device, dtype=points.dtype), torch.tensor(0.5, device=points.device, dtype=points.dtype))
+                fx = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio
+                fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5
+                center = torch.tensor(0.5, device=points.device, dtype=points.dtype)
+                intrinsics = utils3d.pt.intrinsics_from_focal_center(fx, fy, center, center)
             depth = points[..., 2] + shift[..., None, None]
             
             # If projection constraint is forced, recompute the point map using the actual depth map

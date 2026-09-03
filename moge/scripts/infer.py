@@ -15,6 +15,7 @@ import click
 @click.command(help='Inference script')
 @click.option('--input', '-i', 'input_path', type=click.Path(exists=True), help='Input image or folder path. "jpg" and "png" are supported.')
 @click.option('--fov_x', 'fov_x_', type=float, default=None, help='If camera parameters are known, set the horizontal field of view in degrees. Otherwise, MoGe will estimate it.')
+@click.option('--intrinsics', 'intrinsics_path', type=click.Path(exists=True, dir_okay=False), default=None, help='JSON file containing a normalized 3x3 OpenCV intrinsics matrix. Mutually exclusive with --fov_x.')
 @click.option('--output', '-o', 'output_path', default='./output', type=click.Path(), help='Output folder path')
 @click.option('--pretrained', 'pretrained_model_name_or_path', type=str, default=None, help='Pretrained model name or path. Optional for v1/v2 and required for v3.')
 @click.option('--version', 'model_version', type=click.Choice(['v1', 'v2', 'v3']), default='v3', help='Model version. Defaults to "v3"')
@@ -29,13 +30,14 @@ Defaults to 9. Note that it is irrelevant to the output size, which is always th
 `resolution_level` will be ignored if `num_tokens` is provided. Default: None')
 @click.option('--refine_steps', type=click.IntRange(min=0), default=3, help='Number of sparse refinement steps for v3. Defaults to 3.')
 @click.option('--threshold', type=float, default=0.04, help='Threshold for removing edges. Defaults to 0.01. Smaller value removes more edges. "inf" means no thresholding.')
-@click.option('--maps', 'save_maps_', is_flag=True, help='Whether to save the output maps (image, point map, depth map, normal map, mask) and fov.')
+@click.option('--maps', 'save_maps_', is_flag=True, help='Whether to save the output maps (image, point map, depth map, normal map, mask) and camera parameters.')
 @click.option('--glb', 'save_glb_', is_flag=True, help='Whether to save the output as a.glb file. The color will be saved as a texture.')
 @click.option('--ply', 'save_ply_', is_flag=True, help='Whether to save the output as a.ply file. The color will be saved as vertex colors.')
 @click.option('--show', 'show', is_flag=True, help='Whether show the output in a window. Note that this requires pyglet<2 installed as required by trimesh.')
 def main(
     input_path: str,
     fov_x_: float,
+    intrinsics_path: str,
     output_path: str,
     pretrained_model_name_or_path: str,
     model_version: str,
@@ -62,12 +64,32 @@ def main(
     from moge.utils.io import save_glb, save_ply
     from moge.utils.vis import colorize_depth, colorize_normal
     from moge.utils.geometry_numpy import depth_occlusion_edge_numpy
+    from moge.utils.geometry_torch import prepare_intrinsics
     try:
         import utils3d_moge as utils3d
     except ImportError:
         import utils3d
 
     device = torch.device(device_name)
+
+    if intrinsics_path is not None and fov_x_ is not None:
+        raise click.UsageError('--intrinsics and --fov_x are mutually exclusive.')
+    input_intrinsics = None
+    if intrinsics_path is not None:
+        try:
+            with open(intrinsics_path, 'r') as f:
+                intrinsics_data = json.load(f)
+            if isinstance(intrinsics_data, dict):
+                intrinsics_data = intrinsics_data['intrinsics']
+            input_intrinsics = torch.as_tensor(intrinsics_data, dtype=torch.float32, device=device)
+            input_intrinsics = prepare_intrinsics(
+                input_intrinsics, batch_size=1, device=device
+            ).squeeze(0)
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            raise click.UsageError(
+                'Invalid --intrinsics file. Expected a normalized 3x3 JSON array '
+                f'or an object with an "intrinsics" array: {exc}'
+            ) from exc
 
     include_suffices = ['jpg', 'png', 'jpeg', 'JPG', 'PNG', 'JPEG']
     if Path(input_path).is_dir():
@@ -107,6 +129,7 @@ def main(
         # Inference
         infer_kwargs = {
             'fov_x': fov_x_,
+            'intrinsics': input_intrinsics,
             'resolution_level': resolution_level,
             'num_tokens': num_tokens,
             'use_fp16': use_fp16,
@@ -134,6 +157,11 @@ def main(
                 json.dump({
                     'fov_x': round(float(np.rad2deg(fov_x)), 2),
                     'fov_y': round(float(np.rad2deg(fov_y)), 2),
+                }, f)
+            with open(save_path / 'intrinsics.json', 'w') as f:
+                json.dump({
+                    'intrinsics': intrinsics.tolist(),
+                    'normalized': True,
                 }, f)
 
         # Export mesh & visulization
