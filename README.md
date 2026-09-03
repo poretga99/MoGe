@@ -211,6 +211,25 @@ contain `refine_steps + 1` entries, including the initial prediction.
 ```
 For more usage details, see the `MoGeModel.infer()` docstring.
 
+If calibrated camera intrinsics are available, pass a normalized OpenCV camera
+matrix to skip focal-length estimation:
+
+```python
+intrinsics = torch.tensor([
+    [fx / image_width,  skew / image_width, cx / image_width],
+    [0.0,               fy / image_height, cy / image_height],
+    [0.0,               0.0,               1.0],
+], dtype=torch.float32, device=device)
+
+output = model.infer(input_image, intrinsics=intrinsics)
+```
+
+The matrix must describe the exact, undistorted image supplied to the model.
+`intrinsics` and `fov_x` are mutually exclusive. A single `(3, 3)` matrix is
+broadcast over a batch; per-image matrices may be supplied as `(B, 3, 3)`.
+When `--maps` is used, the CLI writes the exact normalized matrix to
+`intrinsics.json` alongside `fov.json`.
+
 ## 💡 Usage
 
 ### Gradio demo
@@ -241,6 +260,9 @@ moge infer -i IMAGES_FOLDER_OR_IMAGE_PATH --version v2 --o OUTPUT_FOLDER --maps 
 # MoGe-3 requires an explicit checkpoint and supports sparse refinement
 moge infer -i IMAGES_FOLDER_OR_IMAGE_PATH --version v3 --pretrained PATH_TO_CKPT.pt --refine_steps 3 --o OUTPUT_FOLDER --maps --glb --ply
 
+# Use calibrated normalized intrinsics from a JSON file
+moge infer -i IMAGE_PATH --version v2 --intrinsics CAMERA_INTRINSICS.json --o OUTPUT_FOLDER --maps --glb --ply
+
 # Show the result in a window (requires pyglet < 2.0, e.g. pip install pyglet==1.5.29)
 moge infer -i IMAGES_FOLDER_OR_IMAGE_PATH --o OUTPUT_FOLDER --show
 ```
@@ -258,6 +280,9 @@ Options:
   --fov_x FLOAT               If camera parameters are known, set the
                               horizontal field of view in degrees. Otherwise,
                               MoGe will estimate it.
+  --intrinsics FILE           JSON file containing a normalized 3x3 OpenCV
+                              intrinsics matrix. Mutually exclusive with
+                              --fov_x.
   -o, --output PATH           Output folder path
   --pretrained TEXT           Pretrained model name or path. Optional for v1/v2
                               and required for v3.
@@ -286,7 +311,8 @@ Options:
                               Smaller value removes more edges. "inf" means no
                               thresholding.
   --maps                      Whether to save the output maps (image, point
-                              map, depth map, normal map, mask) and fov.
+                              map, depth map, normal map, mask) and camera
+                              parameters.
   --glb                       Whether to save the output as a.glb file. The
                               color will be saved as a texture.
   --ply                       Whether to save the output as a.ply file. The

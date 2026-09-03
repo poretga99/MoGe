@@ -115,6 +115,95 @@ def view_plane_uv_to_focal(uv: torch.Tensor):
     return focal
 
 
+def prepare_intrinsics(
+    intrinsics: torch.Tensor,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Validate normalized OpenCV intrinsics and broadcast them over a batch."""
+    intrinsics = torch.as_tensor(intrinsics, device=device, dtype=dtype)
+    if intrinsics.shape == (3, 3):
+        intrinsics = intrinsics.unsqueeze(0)
+    elif intrinsics.ndim != 3 or intrinsics.shape[-2:] != (3, 3):
+        raise ValueError(f"intrinsics must have shape (3, 3) or (B, 3, 3), got {tuple(intrinsics.shape)}")
+
+    if intrinsics.shape[0] == 1:
+        intrinsics = intrinsics.expand(batch_size, -1, -1)
+    elif intrinsics.shape[0] != batch_size:
+        raise ValueError(f"intrinsics batch size must be 1 or {batch_size}, got {intrinsics.shape[0]}")
+
+    if not torch.isfinite(intrinsics).all():
+        raise ValueError("intrinsics must contain only finite values")
+    if not torch.all(intrinsics[:, 0, 0] > 0) or not torch.all(intrinsics[:, 1, 1] > 0):
+        raise ValueError("intrinsics focal lengths must be positive")
+
+    expected_last_row = intrinsics.new_tensor([0.0, 0.0, 1.0]).expand(batch_size, -1)
+    if not torch.allclose(intrinsics[:, 2], expected_last_row, rtol=1e-5, atol=1e-7):
+        raise ValueError("intrinsics must be normalized OpenCV matrices with last row [0, 0, 1]")
+
+    return intrinsics
+
+
+def recover_shift_from_intrinsics(
+    points: torch.Tensor,
+    intrinsics: torch.Tensor,
+    mask: torch.Tensor = None,
+    downsample_size: Tuple[int, int] = (64, 64),
+) -> torch.Tensor:
+    """
+    Recover the Z-axis shift of an affine point map using fixed normalized
+    OpenCV camera intrinsics.
+
+    `intrinsics` may have shape (3, 3) or match the leading batch dimensions
+    of `points`. Lens distortion is not represented by the matrix; callers
+    must provide an undistorted image and intrinsics for that exact image.
+    """
+    if points.ndim < 3 or points.shape[-1] != 3:
+        raise ValueError(f"points must have shape (..., H, W, 3), got {tuple(points.shape)}")
+
+    shape = points.shape
+    height, width = shape[-3:-1]
+    batch_shape = shape[:-3]
+    intrinsics_tensor = torch.as_tensor(intrinsics, device=points.device, dtype=points.dtype)
+    try:
+        intrinsics = torch.broadcast_to(
+            intrinsics_tensor,
+            (*batch_shape, 3, 3),
+        )
+    except RuntimeError as exc:
+        raise ValueError(
+            f"intrinsics shape must be broadcastable to {(*batch_shape, 3, 3)}, got {tuple(intrinsics_tensor.shape)}"
+        ) from exc
+
+    points = points.reshape(-1, height, width, 3)
+    intrinsics = intrinsics.reshape(-1, 3, 3)
+    mask = None if mask is None else mask.reshape(-1, height, width)
+
+    uv = utils3d.pt.uv_map(height, width, dtype=points.dtype, device=points.device)
+    uv_h = torch.cat([uv, torch.ones_like(uv[..., :1])], dim=-1)
+    rays = torch.einsum('hwj,bkj->bhwk', uv_h, torch.linalg.inv(intrinsics))
+    rays = rays[..., :2] / rays[..., 2:]
+
+    points_lr = F.interpolate(points.permute(0, 3, 1, 2), downsample_size, mode='nearest').permute(0, 2, 3, 1)
+    rays_lr = F.interpolate(rays.permute(0, 3, 1, 2), downsample_size, mode='nearest').permute(0, 2, 3, 1)
+    mask_lr = None if mask is None else F.interpolate(mask.to(torch.float32).unsqueeze(1), downsample_size, mode='nearest').squeeze(1) > 0
+
+    points_lr_np = points_lr.detach().cpu().numpy()
+    rays_lr_np = rays_lr.cpu().numpy()
+    mask_lr_np = None if mask is None else mask_lr.cpu().numpy()
+    optim_shift = []
+    for i in range(points.shape[0]):
+        points_i = points_lr_np[i] if mask is None else points_lr_np[i][mask_lr_np[i]]
+        rays_i = rays_lr_np[i] if mask is None else rays_lr_np[i][mask_lr_np[i]]
+        if rays_i.shape[0] < 2:
+            optim_shift.append(0.0)
+            continue
+        optim_shift.append(float(solve_optimal_shift(rays_i, points_i, focal=1.0)))
+
+    return torch.tensor(optim_shift, device=points.device, dtype=points.dtype).reshape(batch_shape)
+
+
 def recover_focal_shift(points: torch.Tensor, mask: torch.Tensor = None, focal: torch.Tensor = None, downsample_size: Tuple[int, int] = (64, 64)):
     """
     Recover the depth map and FoV from a point map with unknown z shift and focal.
@@ -309,4 +398,3 @@ def mask_aware_nearest_resize(
         return outputs, target_mask, index
     else:
         return outputs, target_mask
-

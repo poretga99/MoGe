@@ -17,7 +17,7 @@ except ImportError:
     import utils3d
 from huggingface_hub import hf_hub_download
 
-from ..utils.geometry_torch import normalized_view_plane_uv, recover_focal_shift, angle_diff_vec3
+from ..utils.geometry_torch import normalized_view_plane_uv, prepare_intrinsics, recover_focal_shift, recover_shift_from_intrinsics, angle_diff_vec3
 from .utils import wrap_module_with_gradient_checkpointing, unwrap_module_with_gradient_checkpointing, wrap_module_with_autocast
 from .modules.dinov2_encoder import DINOv2Encoder
 from .modules.mlp import MLP
@@ -238,6 +238,7 @@ class MoGeModel(nn.Module):
         apply_mask: bool = True,
         fov_x: Optional[Union[Number, torch.Tensor]] = None,
         use_fp16: bool = True,
+        intrinsics: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         User-friendly inference function
@@ -250,6 +251,7 @@ class MoGeModel(nn.Module):
         - `apply_mask`: if True, the output point map will be masked using the predicted mask. Default: True
         - `fov_x`: the horizontal camera FoV in degrees. If None, it will be inferred from the predicted point map. Default: None
         - `use_fp16`: if True, use mixed precision to speed up inference. Default: True
+        - `intrinsics`: optional normalized OpenCV camera intrinsics of shape (B, 3, 3) or (3, 3). Mutually exclusive with `fov_x`.
             
         ### Returns
 
@@ -264,6 +266,12 @@ class MoGeModel(nn.Module):
         else:
             omit_batch_dim = False
         image = image.to(dtype=self.dtype, device=self.device)
+
+        if intrinsics is not None and fov_x is not None:
+            raise ValueError("intrinsics and fov_x are mutually exclusive")
+        input_intrinsics = None if intrinsics is None else prepare_intrinsics(
+            intrinsics, batch_size=image.shape[0], device=image.device
+        )
 
         original_height, original_width = image.shape[-2:]
         area = original_height * original_width
@@ -290,17 +298,24 @@ class MoGeModel(nn.Module):
             if points is not None:
                 # Convert affine point map to camera-space. Recover depth and intrinsics from point map.
                 # NOTE: Focal here is the focal length relative to half the image diagonal
-                if fov_x is None:
+                if input_intrinsics is not None:
+                    intrinsics = input_intrinsics
+                    shift = recover_shift_from_intrinsics(points, intrinsics, mask_binary)
+                elif fov_x is None:
                     # Recover focal and shift from predicted point map
                     focal, shift = recover_focal_shift(points, mask_binary)
+                    fx, fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio, focal / 2 * (1 + aspect_ratio ** 2) ** 0.5
+                    center = torch.tensor(0.5, device=points.device, dtype=points.dtype)
+                    intrinsics = utils3d.pt.intrinsics_from_focal_center(fx, fy, center, center)
                 else:
                     # Focal is known, recover shift only
                     focal = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / torch.tan(torch.deg2rad(torch.as_tensor(fov_x, device=points.device, dtype=points.dtype) / 2))
                     if focal.ndim == 0:
                         focal = focal[None].expand(points.shape[0])
                     _, shift = recover_focal_shift(points, mask_binary, focal=focal)
-                fx, fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio, focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 
-                intrinsics = utils3d.pt.intrinsics_from_focal_center(fx, fy, torch.tensor(0.5, device=points.device, dtype=points.dtype), torch.tensor(0.5, device=points.device, dtype=points.dtype))
+                    fx, fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio, focal / 2 * (1 + aspect_ratio ** 2) ** 0.5
+                    center = torch.tensor(0.5, device=points.device, dtype=points.dtype)
+                    intrinsics = utils3d.pt.intrinsics_from_focal_center(fx, fy, center, center)
                 points[..., 2] += shift[..., None, None]
                 if mask_binary is not None:
                     mask_binary &= points[..., 2] > 0        # in case depth is contains negative values (which should never happen in practice)
