@@ -230,6 +230,18 @@ broadcast over a batch; per-image matrices may be supplied as `(B, 3, 3)`.
 When `--maps` is used, the CLI writes the exact normalized matrix to
 `intrinsics.json` alongside `fov.json`.
 
+### Calibrated-intrinsics benchmark
+
+We rendered the same Blender house with four known camera calibrations and ran
+MoGe-2 at 2500 tokens, once with its estimated intrinsics and once with the exact
+normalized matrix. The primary metric below is **raw axial-depth RMSE**:
+`sqrt(mean((Z_pred - Z_Blender)^2))`, in meters, with no post-hoc scale or shift
+alignment. For the 35 mm off-center camera, whose true principal point was
+`(0.34, 0.38)` instead of MoGe's default `(0.5, 0.5)`, supplying `K` reduced raw
+Z RMSE from **6.84 m to 2.05 m (70%)**.
+
+![Known-intrinsics raw depth benchmark](assets/known_intrinsics_benchmark.png)
+
 ## 💡 Usage
 
 ### Gradio demo
